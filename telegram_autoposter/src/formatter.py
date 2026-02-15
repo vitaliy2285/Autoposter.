@@ -1,99 +1,55 @@
-"""Post formatting utilities to produce premium Telegram content style."""
-
 from __future__ import annotations
 
 import random
 import re
-from typing import Iterable
 
-emoji_pools: dict[str, list[str]] = {
-    "мотивирующий": ["🔥", "⚡️", "🚀", "💪", "✨"],
-    "экспертный": ["📌", "💎", "🧠", "📊", "🔍"],
-    "дружеский": ["👋", "😊", "🤗", "💬", "🌟"],
-    "вдохновляющий": ["🌈", "✨", "🕊️", "🌱", "🌟"],
-    "практичный": ["🛠️", "✅", "📎", "🧩", "📍"],
+TONE_EMOJIS = {
+    "мотивирующий": ["🚀", "🔥", "💪"],
+    "экспертный": ["🧠", "📌", "🔍"],
+    "дружеский": ["🤝", "🙂", "✨"],
+    "киберпанк": ["⚡️", "🕶", "💾"],
 }
-
-mood_emoji: dict[str, list[str]] = {
-    "утренний": ["🌅", "☀️"],
-    "вечерний": ["🌆", "🌙"],
-    "праздничный": ["🎉", "🎊"],
-}
-
-LIST_MARKERS = ["✦", "•", "─", "✦"]
+MOOD_EMOJIS = {"утренний": ["🌅"], "вечерний": ["🌆"], "ночной": ["🌙", "🌌"]}
+LIST_BULLETS = ["✦", "•", "─"]
 
 
-def _french_quotes(text: str) -> str:
-    return text.replace('"', "«").replace("'", "’")
-
-
-def _replace_dashes(text: str) -> str:
-    return re.sub(r"\s-\s", " — ", text)
-
-
-def _normalize_list_lines(lines: Iterable[str]) -> list[str]:
-    normalized: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(("- ", "* ")):
-            marker = random.choice(LIST_MARKERS)
-            normalized.append(f"{marker} {stripped[2:].strip()}")
-        else:
-            normalized.append(line.strip())
-    return normalized
-
-
-def _ensure_hashtags(text: str, topic: str) -> str:
-    if re.search(r"#\w+", text, flags=re.UNICODE):
-        return text
-    topic_tag = re.sub(r"\s+", "", topic)
-    variants = [f"#{topic_tag}", "#полезное", "#советы", "#вдохновение", "#telegram"]
-    return f"{text}\n\n{' '.join(variants[: random.randint(3, 5)])}"
-
-
-def format_post(raw_text: str, tone: str, topic: str, mood: str = "утренний") -> str:
-    """Format model output into polished Telegram post caption.
-
-    Args:
-        raw_text: Original generated text.
-        tone: Selected tone used for emoji pool.
-        topic: Channel topic for fallback hashtags.
-        mood: Mood key for optional extra emojis.
-
-    Returns:
-        Telegram-ready text no longer than 1024 chars.
-    """
-    cleaned = raw_text.strip()
-    if not cleaned:
-        cleaned = "Новый день — новые идеи для вашего канала!"
-
-    paragraphs = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
-    if not paragraphs:
-        paragraphs = [cleaned]
-
-    title = paragraphs[0]
-    if not title.startswith("**"):
-        title = f"**{title.strip('* ')}**"
-
-    pool = emoji_pools.get(tone.lower(), ["✨", "📌", "🔥"])
-    mood_pool = mood_emoji.get(mood.lower(), [])
-    prefix = " ".join(random.sample(pool, k=min(2, len(pool))))
-    if mood_pool:
-        prefix = f"{prefix} {random.choice(mood_pool)}".strip()
-    paragraphs[0] = f"{prefix} {title}".strip()
-
-    processed = []
-    for paragraph in paragraphs:
-        lines = paragraph.splitlines()
-        lines = _normalize_list_lines(lines)
-        processed.append("\n".join(lines).strip())
-
-    text = "\n\n".join(processed)
-    text = _french_quotes(text)
-    text = _replace_dashes(text)
-    text = _ensure_hashtags(text, topic=topic)
-
-    if len(text) > 1024:
-        text = text[:1000].rstrip() + "…"
-
+def _typography(text: str) -> str:
+    text = text.replace('"', "«", 1)
+    text = re.sub(r'"([^\"]+)"', r'«\1»', text)
+    text = text.replace(" - ", " — ").replace(" -- ", " — ")
     return text
+
+
+def _hashtags(topic: str, text: str) -> str:
+    if "#" in text:
+        return text
+    words = [w for w in re.findall(r"[а-яА-Яa-zA-Z0-9]+", topic.lower()) if len(w) > 2]
+    base = [f"#{w}" for w in words[:3]] or ["#новости", "#кибербезопасность"]
+    extra = ["#infosec", "#cve", "#autopost"]
+    return f"{text}\n\n{' '.join((base + extra)[:5])}"
+
+
+def format_post(raw_text: str, tone: str, topic: str, mood: str) -> str:
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if not lines:
+        lines = [topic]
+
+    title = lines[0]
+    emojis = random.sample(TONE_EMOJIS.get(tone, ["✨", "📌"]) + MOOD_EMOJIS.get(mood, []), k=2)
+    formatted_lines = [f"<b>{' '.join(emojis)} {title}</b>"]
+
+    bullet_idx = 0
+    for line in lines[1:]:
+        if line.startswith("-") or line.startswith("*"):
+            marker = LIST_BULLETS[bullet_idx % len(LIST_BULLETS)]
+            formatted_lines.append(f"{marker} {line[1:].strip()}")
+            bullet_idx += 1
+        else:
+            formatted_lines.append(line)
+
+    post = "\n\n".join(formatted_lines)
+    post = _typography(post)
+    post = _hashtags(topic, post)
+    if len(post) > 1024:
+        post = post[:1021].rstrip() + "…"
+    return post

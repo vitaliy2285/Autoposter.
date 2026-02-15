@@ -1,319 +1,270 @@
-"""Admin commands and inline controls for bot configuration."""
-
 from __future__ import annotations
 
-import logging
-from dataclasses import asdict
-
 from aiogram import F, Router
-from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.filters import Command
 
-from .config import Settings
-from .formatter import emoji_pools, format_post
+from .config import SettingsManager
 from .scheduler import PostingScheduler
+from .utils import parse_times
 
-LOGGER = logging.getLogger(__name__)
-
-router = Router(name="admin")
-
-TONES = ["мотивирующий", "экспертный", "дружеский", "вдохновляющий", "практичный"]
+TONES = ["мотивирующий", "экспертный", "дружеский", "киберпанк"]
+MOODS = ["утренний", "вечерний", "ночной"]
 STYLES = ["DEFAULT", "KANDINSKY", "UHD", "ANIME"]
-MOODS = ["утренний", "вечерний", "праздничный"]
 
 
 class KandinskyAuthState(StatesGroup):
-    """FSM states for Kandinsky auth setup."""
-
-    wait_type = State()
-    wait_api_key = State()
-    wait_secret = State()
-    wait_email = State()
-    wait_password = State()
+    mode = State()
+    key = State()
+    secret = State()
+    email = State()
+    password = State()
 
 
 class OpenAIState(StatesGroup):
-    """FSM states for OpenAI settings setup."""
-
-    wait_url = State()
-    wait_key = State()
-    wait_text_model = State()
-    wait_prompt_model = State()
+    base_url = State()
+    key = State()
+    model = State()
 
 
-def _admin_only(message: Message, settings: Settings) -> bool:
-    user_id = message.from_user.id if message.from_user else 0
-    return user_id in settings.admin_ids
+def admin_router(settings_manager: SettingsManager, scheduler: PostingScheduler) -> Router:
+    router = Router()
 
+    def allowed(message: Message) -> bool:
+        return bool(message.from_user and message.from_user.id in settings_manager.settings.admin_ids)
 
-def _build_choice_keyboard(prefix: str, values: list[str], columns: int = 2) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for value in values:
-        builder.button(text=value.capitalize(), callback_data=f"{prefix}:{value}")
-    builder.adjust(columns)
-    return builder.as_markup()
-
-
-def register_handlers(bot_router: Router, settings: Settings, scheduler: PostingScheduler) -> None:
-    """Register router handlers with injected runtime dependencies."""
+    def cb_keyboard(prefix: str, values: list[str]) -> InlineKeyboardMarkup:
+        rows = [[InlineKeyboardButton(text=v, callback_data=f"{prefix}:{v}")] for v in values]
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
     @router.message(Command("start"))
-    async def start_handler(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+    async def start(message: Message) -> None:
+        if not allowed(message):
             return
         await message.answer(
-            "Привет! Я автопостер. Основные команды: /settings /set_topic /set_times /set_tone /set_style "
-            "/set_image_size /set_channel /toggle /post_now /stats /reset"
+            "Готово. Команды: /set_topic /set_times /set_tone /set_mood /set_style /set_image_size "
+            "/set_auth_kandinsky /set_openai /set_keywords /set_channel /toggle /post_now /stats /settings /reset"
         )
 
     @router.message(Command("set_topic"))
     async def set_topic(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
         topic = message.text.replace("/set_topic", "", 1).strip()
         if not topic:
             await message.answer("Использование: /set_topic <тема>")
             return
-        settings.topic = topic
-        await settings.save()
-        await message.answer(f"✅ Тема обновлена: {topic}")
+        await settings_manager.update(topic=topic)
+        await message.answer("✅ Тема обновлена")
+
+    @router.message(Command("set_keywords"))
+    async def set_keywords(message: Message) -> None:
+        if not allowed(message):
+            return
+        raw = message.text.replace("/set_keywords", "", 1).strip()
+        if not raw:
+            await message.answer("Использование: /set_keywords cve,exploit,rce")
+            return
+        values = [x.strip().lower() for x in raw.split(",") if x.strip()]
+        await settings_manager.update(source_keywords=values)
+        await message.answer("✅ Ключевые слова источника обновлены")
 
     @router.message(Command("set_times"))
     async def set_times(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
-        payload = message.text.replace("/set_times", "", 1).strip()
-        times = [item.strip() for item in payload.split(",") if item.strip()]
-        if not times:
-            await message.answer("Использование: /set_times <09:00,15:00,21:00>")
+        raw = message.text.replace("/set_times", "", 1).strip()
+        try:
+            times = parse_times(raw)
+        except Exception:
+            await message.answer("Формат: /set_times 09:00,15:00,21:00")
             return
-        settings.posting_times = times
-        await settings.save()
+        await settings_manager.update(posting_times=times)
         scheduler.reload_jobs()
-        await message.answer("✅ Времена публикации обновлены")
+        await message.answer("✅ Время публикаций обновлено")
 
     @router.message(Command("set_tone"))
     async def set_tone(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
-        await message.answer("Выберите тон:", reply_markup=_build_choice_keyboard("tone", TONES))
+        await message.answer("Выберите тон:", reply_markup=cb_keyboard("tone", TONES))
 
     @router.callback_query(F.data.startswith("tone:"))
-    async def tone_callback(callback: CallbackQuery) -> None:
-        tone = callback.data.split(":", 1)[1]
-        settings.tone = tone
-        await settings.save()
-        await callback.message.answer(f"✅ Тон установлен: {tone}")
+    async def tone_cb(callback: CallbackQuery) -> None:
+        value = callback.data.split(":", 1)[1]
+        await settings_manager.update(tone=value)
+        await callback.message.answer(f"✅ Тон: {value}")
         await callback.answer()
 
     @router.message(Command("set_mood"))
     async def set_mood(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
-        await message.answer("Выберите настроение:", reply_markup=_build_choice_keyboard("mood", MOODS))
+        await message.answer("Выберите настроение:", reply_markup=cb_keyboard("mood", MOODS))
 
     @router.callback_query(F.data.startswith("mood:"))
-    async def mood_callback(callback: CallbackQuery) -> None:
-        mood = callback.data.split(":", 1)[1]
-        settings.mood = mood
-        await settings.save()
-        await callback.message.answer(f"✅ Настроение установлено: {mood}")
+    async def mood_cb(callback: CallbackQuery) -> None:
+        value = callback.data.split(":", 1)[1]
+        await settings_manager.update(mood=value)
+        await callback.message.answer(f"✅ Настроение: {value}")
         await callback.answer()
 
     @router.message(Command("set_style"))
     async def set_style(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
-        await message.answer("Выберите стиль Kandinsky:", reply_markup=_build_choice_keyboard("style", STYLES))
+        await message.answer("Выберите стиль:", reply_markup=cb_keyboard("style", STYLES))
 
     @router.callback_query(F.data.startswith("style:"))
-    async def style_callback(callback: CallbackQuery) -> None:
-        style = callback.data.split(":", 1)[1]
-        settings.kandinsky_style = style
-        await settings.save()
-        await callback.message.answer(f"✅ Стиль установлен: {style}")
+    async def style_cb(callback: CallbackQuery) -> None:
+        value = callback.data.split(":", 1)[1]
+        await settings_manager.update(kandinsky_style=value)
+        await callback.message.answer(f"✅ Стиль: {value}")
         await callback.answer()
 
     @router.message(Command("set_image_size"))
     async def set_image_size(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
         parts = message.text.split()
         if len(parts) != 3:
             await message.answer("Использование: /set_image_size <width> <height>")
             return
-        settings.kandinsky_width = int(parts[1])
-        settings.kandinsky_height = int(parts[2])
-        await settings.save()
-        await message.answer("✅ Размер изображения обновлён")
+        await settings_manager.update(kandinsky_width=int(parts[1]), kandinsky_height=int(parts[2]))
+        await message.answer("✅ Размер обновлён")
 
     @router.message(Command("set_channel"))
     async def set_channel(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
         channel = message.text.replace("/set_channel", "", 1).strip()
         if not channel:
-            await message.answer("Использование: /set_channel <@channel или ID>")
+            await message.answer("Использование: /set_channel <@channel|ID>")
             return
-        settings.telegram_channel = channel
-        await settings.save()
-        await message.answer(f"✅ Канал установлен: {channel}")
+        try:
+            me = await message.bot.get_me()
+            member = await message.bot.get_chat_member(channel, me.id)
+            if member.status not in {"administrator", "creator"}:
+                await message.answer("Бот не администратор канала")
+                return
+        except Exception:
+            await message.answer("Не удалось проверить права, но канал сохранён")
+        await settings_manager.update(channel_id=channel)
+        scheduler.reload_jobs()
+        await message.answer("✅ Канал сохранён")
 
     @router.message(Command("toggle"))
     async def toggle(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
-        settings.is_active = not settings.is_active
-        await settings.save()
+        value = not settings_manager.settings.autopost_enabled
+        await settings_manager.update(autopost_enabled=value)
         scheduler.reload_jobs()
-        await message.answer(f"✅ Автопостинг: {'включён' if settings.is_active else 'выключен'}")
+        await message.answer(f"✅ Автопостинг {'включён' if value else 'выключен'}")
 
     @router.message(Command("post_now"))
     async def post_now(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
-        await scheduler.publish_post()
-        await message.answer("✅ Попытка публикации выполнена, смотрите лог и канал.")
+        await scheduler.publish_post(force=True)
+        await message.answer("✅ Запущена тестовая публикация")
 
     @router.message(Command("stats"))
     async def stats(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
-        next_post = scheduler.get_next_run() or "не запланировано"
+        stats = settings_manager.settings.stats
         await message.answer(
-            f"Всего постов: {settings.stats.total_posts}\n"
-            f"Последний пост: {settings.stats.last_post_time or '—'}\n"
-            f"Следующий пост: {next_post}\n"
-            f"Статус: {'вкл' if settings.is_active else 'выкл'}"
+            f"Постов: {stats.total_posts}\nПоследний: {stats.last_post_at or '—'}\nСледующий: {scheduler.next_run() or '—'}"
         )
 
     @router.message(Command("settings"))
     async def show_settings(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
-        snapshot = asdict(settings)
-        snapshot.pop("openai_key", None)
-        snapshot.pop("kandinsky_password", None)
-        snapshot.pop("kandinsky_secret_key", None)
-        snapshot.pop("kandinsky_api_key", None)
-        snapshot.pop("project_root", None)
-        await message.answer("Текущие настройки:\n" + "\n".join(f"{k}: {v}" for k, v in snapshot.items()))
+        data = settings_manager.settings.model_dump()
+        for secret in ["openai_api_key", "kandinsky_api_key", "kandinsky_secret_key", "kandinsky_password"]:
+            data.pop(secret, None)
+        await message.answer("\n".join([f"{k}: {v}" for k, v in data.items()]))
 
     @router.message(Command("reset"))
     async def reset(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
-        await settings.reset_to_env()
+        await settings_manager.reset_to_env()
         scheduler.reload_jobs()
-        await message.answer("✅ Настройки сброшены к значениям .env")
+        await message.answer("✅ Сброшено к .env")
 
     @router.message(Command("set_auth_kandinsky"))
     async def set_auth_kandinsky(message: Message, state: FSMContext) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
-        await state.set_state(KandinskyAuthState.wait_type)
-        await message.answer("Выберите тип авторизации: api или web")
+        await state.set_state(KandinskyAuthState.mode)
+        await message.answer("Введите режим авторизации: api или web")
 
-    @router.message(KandinskyAuthState.wait_type)
-    async def kandinsky_type(message: Message, state: FSMContext) -> None:
-        value = message.text.strip().lower()
-        if value not in {"api", "web"}:
-            await message.answer("Введите api или web")
+    @router.message(KandinskyAuthState.mode)
+    async def k_mode(message: Message, state: FSMContext) -> None:
+        mode = message.text.strip().lower()
+        if mode not in {"api", "web"}:
+            await message.answer("Только api или web")
             return
-        settings.kandinsky_auth_type = value
-        if value == "api":
-            await state.set_state(KandinskyAuthState.wait_api_key)
+        await settings_manager.update(kandinsky_auth_mode=mode)
+        if mode == "api":
+            await state.set_state(KandinskyAuthState.key)
             await message.answer("Введите KANDINSKY_API_KEY")
         else:
-            await state.set_state(KandinskyAuthState.wait_email)
-            await message.answer("Введите email FusionBrain")
+            await state.set_state(KandinskyAuthState.email)
+            await message.answer("Введите email")
 
-    @router.message(KandinskyAuthState.wait_api_key)
-    async def kandinsky_api_key(message: Message, state: FSMContext) -> None:
-        settings.kandinsky_api_key = message.text.strip()
-        await state.set_state(KandinskyAuthState.wait_secret)
+    @router.message(KandinskyAuthState.key)
+    async def k_key(message: Message, state: FSMContext) -> None:
+        await settings_manager.update(kandinsky_api_key=message.text.strip())
+        await state.set_state(KandinskyAuthState.secret)
         await message.answer("Введите KANDINSKY_SECRET_KEY")
 
-    @router.message(KandinskyAuthState.wait_secret)
-    async def kandinsky_secret(message: Message, state: FSMContext) -> None:
-        settings.kandinsky_secret_key = message.text.strip()
-        await settings.save()
+    @router.message(KandinskyAuthState.secret)
+    async def k_secret(message: Message, state: FSMContext) -> None:
+        await settings_manager.update(kandinsky_secret_key=message.text.strip())
         await state.clear()
-        await message.answer("✅ Данные Kandinsky (api) обновлены")
+        await message.answer("✅ Kandinsky API auth сохранён")
 
-    @router.message(KandinskyAuthState.wait_email)
-    async def kandinsky_email(message: Message, state: FSMContext) -> None:
-        settings.kandinsky_email = message.text.strip()
-        await state.set_state(KandinskyAuthState.wait_password)
-        await message.answer("Введите пароль FusionBrain")
+    @router.message(KandinskyAuthState.email)
+    async def k_email(message: Message, state: FSMContext) -> None:
+        await settings_manager.update(kandinsky_email=message.text.strip())
+        await state.set_state(KandinskyAuthState.password)
+        await message.answer("Введите пароль")
 
-    @router.message(KandinskyAuthState.wait_password)
-    async def kandinsky_password(message: Message, state: FSMContext) -> None:
-        settings.kandinsky_password = message.text.strip()
-        await settings.save()
+    @router.message(KandinskyAuthState.password)
+    async def k_password(message: Message, state: FSMContext) -> None:
+        await settings_manager.update(kandinsky_password=message.text.strip())
         await state.clear()
-        await message.answer("✅ Данные Kandinsky (web) обновлены")
+        await message.answer("✅ Kandinsky WEB auth сохранён")
 
     @router.message(Command("set_openai"))
     async def set_openai(message: Message, state: FSMContext) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
+        if not allowed(message):
             return
-        await state.set_state(OpenAIState.wait_url)
-        await message.answer("Введите OPENAI_URL")
+        await state.set_state(OpenAIState.base_url)
+        await message.answer("Введите OPENAI_BASE_URL")
 
-    @router.message(OpenAIState.wait_url)
-    async def openai_url(message: Message, state: FSMContext) -> None:
-        settings.openai_url = message.text.strip()
-        await state.set_state(OpenAIState.wait_key)
-        await message.answer("Введите OPENAI_KEY")
+    @router.message(OpenAIState.base_url)
+    async def oa_url(message: Message, state: FSMContext) -> None:
+        await settings_manager.update(openai_base_url=message.text.strip())
+        await state.set_state(OpenAIState.key)
+        await message.answer("Введите OPENAI_API_KEY")
 
-    @router.message(OpenAIState.wait_key)
-    async def openai_key(message: Message, state: FSMContext) -> None:
-        settings.openai_key = message.text.strip()
-        await state.set_state(OpenAIState.wait_text_model)
-        await message.answer("Введите TEXT_MODEL")
+    @router.message(OpenAIState.key)
+    async def oa_key(message: Message, state: FSMContext) -> None:
+        await settings_manager.update(openai_api_key=message.text.strip())
+        await state.set_state(OpenAIState.model)
+        await message.answer("Введите OPENAI_MODEL")
 
-    @router.message(OpenAIState.wait_text_model)
-    async def openai_text_model(message: Message, state: FSMContext) -> None:
-        settings.text_model = message.text.strip()
-        await state.set_state(OpenAIState.wait_prompt_model)
-        await message.answer("Введите PROMPT_MODEL")
-
-    @router.message(OpenAIState.wait_prompt_model)
-    async def openai_prompt_model(message: Message, state: FSMContext) -> None:
-        settings.prompt_model = message.text.strip()
-        await settings.save()
+    @router.message(OpenAIState.model)
+    async def oa_model(message: Message, state: FSMContext) -> None:
+        await settings_manager.update(openai_model=message.text.strip())
         await state.clear()
-        await message.answer("✅ Настройки OpenAI обновлены")
+        await message.answer("✅ OpenAI-совместимый API сохранён")
 
-    @router.message(Command("test_format"))
-    async def test_format(message: Message) -> None:
-        if not _admin_only(message, settings):
-            await message.answer("⛔ Доступ запрещён")
-            return
-        text = message.text.replace("/test_format", "", 1).strip()
-        if not text:
-            await message.answer("Использование: /test_format <текст>")
-            return
-        await message.answer(format_post(text, tone=settings.tone, topic=settings.topic, mood=settings.mood))
-
-    bot_router.include_router(router)
-    LOGGER.info("Admin handlers registered. Emoji pools available: %s", list(emoji_pools.keys()))
+    return router

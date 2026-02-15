@@ -1,60 +1,43 @@
-"""Orchestrator that creates full post content: text + image."""
-
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
-from .ai_client import AIClient
-from .config import Settings
+from .config import SettingsManager
 from .formatter import format_post
-from .image_generator import ImageGenerator
-from .utils import sha256_text
+from .generators import DeepSeekTextGenerator, KandinskyImageGenerator
+from .models import PostPackage
+from .sources import GitHubHunter
+from .utils import make_hash
 
 LOGGER = logging.getLogger(__name__)
 
 
 class ContentCreator:
-    """Content pipeline with anti-duplication checks."""
+    def __init__(self, settings_manager: SettingsManager, image_generator: KandinskyImageGenerator) -> None:
+        self.settings_manager = settings_manager
+        self.source = GitHubHunter(settings_manager)
+        self.text_generator = DeepSeekTextGenerator(settings_manager)
+        self.image_generator = image_generator
 
-    def __init__(self, settings: Settings, project_root: Path) -> None:
-        self.settings = settings
-        self.ai_client = AIClient(settings)
-        self.image_generator = ImageGenerator(settings, project_root=project_root)
+    async def build_post(self, force: bool = False) -> PostPackage | None:
+        settings = self.settings_manager.settings
+        news = await self.source.fetch()
+        if not news:
+            LOGGER.info("No unique news found")
+            return None
 
-    async def create_post(self) -> tuple[str, Path, str]:
-        """Generate unique text, format it and create corresponding image.
+        raw_text = await self.text_generator.generate_post(news)
+        if not raw_text:
+            LOGGER.warning("Text generator returned empty text")
+            return None
 
-        Returns:
-            Tuple of (formatted_text, image_path, text_hash).
-        """
-        generated_text = ""
-        text_hash = ""
-        for attempt in range(1, 4):
-            uniqueness_hint = ""
-            if attempt > 1:
-                uniqueness_hint = "Сделай пост существенно отличающимся по структуре и примерам от предыдущих."
+        content_hash = make_hash(f"{news.url}:{raw_text}")
+        if not force and content_hash in settings.recent_hashes:
+            LOGGER.info("Duplicate hash detected; skip")
+            return None
 
-            generated_text = await self.ai_client.generate_post_text(
-                topic=self.settings.topic,
-                tone_description=self.settings.tone,
-                mood=self.settings.mood,
-                extra_instruction=uniqueness_hint,
-            )
-            text_hash = sha256_text(generated_text)
-            if text_hash not in self.settings.last_posts_hashes:
-                break
-            LOGGER.info("Detected duplicated post hash on attempt %s", attempt)
-        else:
-            raise RuntimeError("Failed to generate unique post text after 3 attempts")
+        formatted = format_post(raw_text, settings.tone, settings.topic, settings.mood)
+        prompt = await self.text_generator.generate_image_prompt(news, formatted)
+        image_path = await self.image_generator.generate(prompt)
 
-        formatted = format_post(
-            raw_text=generated_text,
-            tone=self.settings.tone,
-            topic=self.settings.topic,
-            mood=self.settings.mood,
-        )
-        image_prompt = await self.ai_client.generate_image_prompt(formatted)
-        image_path = await self.image_generator.generate(image_prompt)
-
-        return formatted, image_path, text_hash
+        return PostPackage(text=formatted, image_path=image_path, news=news, content_hash=content_hash)
